@@ -128,7 +128,6 @@ EMAIL_DESTINATARIOS = [
 # ─────────────────────────────────────────────────────────────────
 # CONFIGURACIÓN DE NOTICIAS — NewsAPI
 # ─────────────────────────────────────────────────────────────────
-NEWSAPI_KEY     = os.environ.get("NEWSAPI_KEY", "a7d2cb2e98ff4271bb2de60a351e3181")
 NEWSAPI_SOURCES = "reuters,cnbc"
 
 NEWSAPI_QUERIES = {
@@ -712,6 +711,16 @@ def obtener_noticias_rss() -> dict:
     resultado        = {}
     fuentes_fallidas = []
 
+    # Leer API key: st.secrets en Streamlit Cloud, os.environ como fallback en CLI
+    try:
+        api_key = st.secrets.get("NEWS_API_KEY", "") or os.environ.get("NEWS_API_KEY", "")
+    except Exception:
+        api_key = os.environ.get("NEWS_API_KEY", "")
+
+    if not api_key:
+        print("[NewsAPI] API key no configurada — usando fallback")
+        return _construir_fallback(ahora)
+
     print(f"[NewsAPI] Descargando {len(NEWSAPI_QUERIES)} categorías...")
     for categoria, query in NEWSAPI_QUERIES.items():
         try:
@@ -722,7 +731,7 @@ def obtener_noticias_rss() -> dict:
                 "&sortBy=publishedAt"
                 "&pageSize=10"
                 "&language=en"
-                f"&apiKey={NEWSAPI_KEY}"
+                f"&apiKey={api_key}"
             )
             resp = requests.get(url, timeout=10)
             data = resp.json()
