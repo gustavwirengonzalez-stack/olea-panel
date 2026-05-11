@@ -126,15 +126,16 @@ EMAIL_DESTINATARIOS = [
 ]
 
 # ─────────────────────────────────────────────────────────────────
-# CONFIGURACIÓN DE NOTICIAS RSS
-# Google News RSS por búsqueda — más fiable desde Streamlit Cloud que feeds directos.
-# Las claves coinciden exactamente con las categorías de CATEGORIAS_NOTICIAS.
+# CONFIGURACIÓN DE NOTICIAS — NewsAPI
 # ─────────────────────────────────────────────────────────────────
-FUENTES_RSS = {
-    "BCE Y MACRO EUROPEA":    "https://news.google.com/rss/search?q=ECB+interest+rates+eurozone+inflation+Lagarde&hl=en&gl=US&ceid=US:en",
-    "GEOPOLÍTICA Y ENERGÍA":  "https://news.google.com/rss/search?q=Iran+Hormuz+oil+Houthis+Red+Sea+conflict&hl=en&gl=US&ceid=US:en",
-    "MERCADOS Y RENTA FIJA":  "https://news.google.com/rss/search?q=Bund+yield+Treasury+bonds+credit+spread+Europe&hl=en&gl=US&ceid=US:en",
-    "EMPLEO Y FED AMERICANA": "https://news.google.com/rss/search?q=Federal+Reserve+Powell+jobs+Non-Farm+Payrolls&hl=en&gl=US&ceid=US:en",
+NEWSAPI_KEY     = os.environ.get("NEWSAPI_KEY", "a7d2cb2e98ff4271bb2de60a351e3181")
+NEWSAPI_SOURCES = "reuters,cnbc"
+
+NEWSAPI_QUERIES = {
+    "BCE Y MACRO EUROPEA":    "ECB interest rates eurozone inflation Lagarde",
+    "GEOPOLÍTICA Y ENERGÍA":  "Iran Hormuz oil Houthis Red Sea conflict",
+    "MERCADOS Y RENTA FIJA":  "Bund yield Treasury bonds credit spread Europe",
+    "EMPLEO Y FED AMERICANA": "Federal Reserve Powell jobs Non-Farm Payrolls",
 }
 
 # Noticias de ejemplo como último recurso si todos los feeds fallan
@@ -700,166 +701,93 @@ def cargar_datos() -> dict:
     }
 
 
-@st.cache_data(ttl=1800)  # Cache 30 min — feeds RSS
-def obtener_noticias_rss(newsapi_key: str = "") -> dict:
+@st.cache_data(ttl=1800)  # Cache 30 min — NewsAPI
+def obtener_noticias_rss() -> dict:
     """
-    Descarga y clasifica noticias RSS de todas las fuentes configuradas.
-    Retorna dict con una clave por categoría (lista de noticias, máx. 3)
-    más '_fuentes_fallidas' y '_usando_fallback' para control de UI.
-    Cada noticia: {titulo, fuente, fecha, link, hace_horas}.
+    Descarga noticias desde NewsAPI por categoría.
+    Fuentes: Financial Times, Reuters, Bloomberg, WSJ, CNBC.
+    Máx. 3 noticias por categoría, últimos 14 días, ordenadas más recientes primero.
     """
-    from calendar import timegm
+    ahora            = datetime.now()
+    resultado        = {}
+    fuentes_fallidas = []
 
-    ahora = datetime.now()
-
-    if not _FEEDPARSER_OK:
-        print("[RSS] feedparser no disponible — usando fallback")
-        return _construir_fallback(ahora)
-
-    resultado:        dict      = {}
-    fuentes_fallidas: list[str] = []
-
-    print(f"[RSS] Descargando {len(FUENTES_RSS)} feeds de Google News...")
-    for categoria, url in FUENTES_RSS.items():
+    print(f"[NewsAPI] Descargando {len(NEWSAPI_QUERIES)} categorías...")
+    for categoria, query in NEWSAPI_QUERIES.items():
         try:
-            feed    = feedparser.parse(url)
-            status  = feed.get("status", "N/A")
-            n_items = len(feed.entries)
-            bozo    = feed.get("bozo", False)
-            bozo_e  = str(feed.get("bozo_exception", ""))[:120]
+            url = (
+                "https://newsapi.org/v2/everything"
+                f"?q={requests.utils.quote(query)}"
+                f"&sources={NEWSAPI_SOURCES}"
+                "&sortBy=publishedAt"
+                "&pageSize=10"
+                "&language=en"
+                f"&apiKey={NEWSAPI_KEY}"
+            )
+            resp = requests.get(url, timeout=10)
+            data = resp.json()
 
-            print(f"  [{categoria}] status={status}  entradas={n_items}  bozo={bozo}"
-                  + (f"  err={bozo_e}" if bozo and bozo_e else ""))
-
-            if n_items == 0:
+            if data.get("status") != "ok":
+                print(f"  [{categoria}] error: {data.get('message','?')}")
                 fuentes_fallidas.append(categoria)
                 resultado[categoria] = []
                 continue
 
-            noticias_cat: list[dict] = []
-            for entry in feed.entries[:10]:
-                titulo = entry.get("title", "").strip()
-                link   = entry.get("link",  "#")
-
-                fecha = None
-                for campo in ("published_parsed", "updated_parsed"):
-                    t = entry.get(campo)
-                    if t:
-                        try:
-                            fecha = datetime.fromtimestamp(timegm(t))
-                        except Exception:
-                            pass
-                        break
-                if fecha is None:
+            items = []
+            for art in data.get("articles", []):
+                titulo = (art.get("title") or "").strip()
+                if not titulo or titulo == "[Removed]":
+                    continue
+                link        = art.get("url", "#")
+                fuente      = (art.get("source") or {}).get("name", "NewsAPI")
+                fecha_str   = art.get("publishedAt", "")
+                try:
+                    fecha = datetime.fromisoformat(
+                        fecha_str.replace("Z", "+00:00")
+                    ).replace(tzinfo=None)
+                except Exception:
                     fecha = ahora
-
                 hace_horas = max(0.0, (ahora - fecha).total_seconds() / 3600)
-                noticias_cat.append({
+                items.append({
                     "titulo":     titulo,
-                    "fuente":     "Google News",
+                    "fuente":     fuente,
                     "fecha":      fecha,
                     "link":       link,
                     "hace_horas": hace_horas,
                 })
 
-            noticias_cat = [n for n in noticias_cat if n["hace_horas"] <= 336]
-            noticias_cat.sort(key=lambda x: x["fecha"], reverse=True)
-            resultado[categoria] = noticias_cat[:3]
-            print(f"  [{categoria}] {len(noticias_cat)} entradas → mostrando {len(resultado[categoria])}")
+            items = [n for n in items if n["hace_horas"] <= 336]
+            items.sort(key=lambda x: x["fecha"], reverse=True)
+            resultado[categoria] = items[:3]
+            print(f"  [{categoria}] {len(resultado[categoria])} noticias")
 
         except Exception as exc:
             print(f"  [{categoria}] EXCEPCIÓN: {exc}")
             fuentes_fallidas.append(categoria)
             resultado[categoria] = []
 
-    total = sum(len(v) for v in resultado.values())
-    print(f"[RSS] Total noticias: {total}  fuentes fallidas: {fuentes_fallidas or 'ninguna'}")
+    resultado["_fuentes_fallidas"] = fuentes_fallidas
+    resultado["_usando_fallback"]  = False
 
-    cats_vacias = [c for c, v in resultado.items() if not v]
-
-    # ── Backup: NewsAPI si hay API key y alguna categoría queda vacía ──
-    if newsapi_key and cats_vacias:
-        print(f"[RSS] Intentando NewsAPI para: {cats_vacias}")
-        resultado = _completar_con_newsapi(resultado, cats_vacias, newsapi_key, ahora)
-
-    resultado["_fuentes_fallidas"]  = fuentes_fallidas
-    resultado["_usando_fallback"]   = False
-
-    # ── Último recurso: fallback hardcodeado ──────────────────────────
     if all(not v for cat, v in resultado.items() if not cat.startswith("_")):
-        print("[RSS] Todos los feeds vacíos — usando noticias de ejemplo")
+        print("[NewsAPI] Todo vacío — usando noticias de ejemplo")
         return _construir_fallback(ahora)
 
     return resultado
 
 
 def _construir_fallback(ahora: datetime) -> dict:
+    import datetime as _dt
     resultado: dict = {}
     for categoria, items in _NOTICIAS_FALLBACK.items():
         resultado[categoria] = [
-            {**n, "fecha": ahora - __import__("datetime").timedelta(hours=n["hace_horas"])}
+            {**n, "fecha": ahora - _dt.timedelta(hours=n["hace_horas"])}
             for n in items
         ]
     for cat in CATEGORIAS_NOTICIAS:
         resultado.setdefault(cat, [])
-    resultado["_fuentes_fallidas"] = list(FUENTES_RSS.keys())
+    resultado["_fuentes_fallidas"] = list(NEWSAPI_QUERIES.keys())
     resultado["_usando_fallback"]  = True
-    return resultado
-
-
-def _completar_con_newsapi(
-    resultado: dict,
-    cats_vacias: list[str],
-    api_key: str,
-    ahora: datetime,
-) -> dict:
-    """Rellena categorías vacías usando NewsAPI (requiere key gratuita)."""
-    from calendar import timegm
-
-    consultas = {
-        "BCE Y MACRO EUROPEA":    "ECB Lagarde euribor inflation eurozone",
-        "GEOPOLÍTICA Y ENERGÍA":  "oil Brent crude geopolitics energy",
-        "MERCADOS Y RENTA FIJA":  "bonds yield markets S&P Bund",
-        "EMPLEO Y FED AMERICANA": "Federal Reserve Powell employment payrolls",
-    }
-
-    for cat in cats_vacias:
-        q = consultas.get(cat, "economy finance")
-        url = (
-            "https://newsapi.org/v2/everything"
-            f"?q={requests.utils.quote(q)}"
-            "&sortBy=publishedAt&language=en&pageSize=5"
-            f"&apiKey={api_key}"
-        )
-        try:
-            resp = requests.get(url, timeout=8)
-            data = resp.json()
-            if data.get("status") != "ok":
-                print(f"  [NewsAPI/{cat}] error: {data.get('message','?')}")
-                continue
-            items = []
-            for art in data.get("articles", []):
-                titulo = (art.get("title") or "").strip()
-                link   = art.get("url", "#")
-                fecha_str = art.get("publishedAt", "")
-                try:
-                    from datetime import datetime as _dt
-                    fecha = _dt.fromisoformat(fecha_str.replace("Z", "+00:00")).replace(tzinfo=None)
-                except Exception:
-                    fecha = ahora
-                hace_horas = max(0.0, (ahora - fecha).total_seconds() / 3600)
-                items.append({
-                    "titulo":    titulo,
-                    "fuente":    "NewsAPI",
-                    "fecha":     fecha,
-                    "link":      link,
-                    "hace_horas": hace_horas,
-                })
-            resultado[cat] = items[:3]
-            print(f"  [NewsAPI/{cat}] {len(items)} noticias")
-        except Exception as exc:
-            print(f"  [NewsAPI/{cat}] EXCEPCIÓN: {exc}")
-
     return resultado
 
 
@@ -1442,27 +1370,15 @@ def panel_alertas(alertas: list[str]) -> str:
 def renderizar_noticias():
     """
     Renderiza la sección NOTICIAS RELEVANTES al final del dashboard.
-    Muestra 4 categorías en layout de 2 columnas. Resistente a fallos de RSS.
+    Muestra 4 categorías en layout de 2 columnas. Fuente: NewsAPI.
     """
-    # Sidebar: NewsAPI key opcional
-    with st.sidebar:
-        st.markdown("---")
-        st.markdown("**Noticias — API opcional**")
-        newsapi_key = st.text_input(
-            "NewsAPI key",
-            value="",
-            type="password",
-            help="Clave gratuita en newsapi.org — solo se usa si los feeds RSS no devuelven resultados",
-            placeholder="xxxxxxxxxxxxxxxx",
-        )
-
     st.markdown(sec("NOTICIAS RELEVANTES"), unsafe_allow_html=True)
 
     try:
-        noticias = obtener_noticias_rss(newsapi_key=newsapi_key)
+        noticias = obtener_noticias_rss()
     except Exception as exc:
         st.markdown(
-            f'<div class="ts">⚠ Error al cargar noticias RSS: {exc}</div>',
+            f'<div class="ts">⚠ Error al cargar noticias: {exc}</div>',
             unsafe_allow_html=True
         )
         return
@@ -1473,14 +1389,14 @@ def renderizar_noticias():
     if usando_fallback:
         st.markdown(
             '<div class="ts" style="margin-bottom:6px; color:#F5A623;">'
-            '⚠ Feeds RSS no disponibles — mostrando noticias de ejemplo. '
-            'Comprueba la conexión o añade una NewsAPI key en el panel lateral.</div>',
+            '⚠ NewsAPI no disponible — mostrando noticias de ejemplo. '
+            'Comprueba la conexión o la API key.</div>',
             unsafe_allow_html=True
         )
     elif fuentes_fallidas:
         st.markdown(
             f'<div class="ts" style="margin-bottom:6px;">'
-            f'Fuente no disponible: {", ".join(fuentes_fallidas)}</div>',
+            f'Sin datos de: {", ".join(fuentes_fallidas)}</div>',
             unsafe_allow_html=True
         )
 
