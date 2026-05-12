@@ -22,16 +22,8 @@ jobs:
       - name: Instalar dependencias
         run: pip install yfinance pandas requests feedparser
 
-      - name: Comprobar hora de Madrid y enviar email
+      - name: Enviar email diario
         env:
           EMAIL_REMITENTE: ${{ secrets.EMAIL_REMITENTE }}
           EMAIL_PASSWORD:  ${{ secrets.EMAIL_PASSWORD }}
-        run: |
-          HORA_MADRID=$(TZ="Europe/Madrid" date +%H)
-          echo "Hora actual en Madrid: ${HORA_MADRID}:00"
-          if [ "$HORA_MADRID" = "09" ]; then
-            echo "Son las 9AM en Madrid — ejecutando email diario..."
-            python dashboard.py --daily
-          else
-            echo "Workflow disparado fuera de hora (${HORA_MADRID}h Madrid) — omitiendo envío."
-          fi
+        run: python dashboard.py --daily
