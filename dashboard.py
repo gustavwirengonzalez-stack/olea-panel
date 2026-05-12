@@ -89,9 +89,6 @@ if not _CLI_MODE and not _WEEKLY_MODE and not _DAILY_MODE:
 TIPO_BCE_PCT      = 2.00   # % — Tipo de depósito BCE (decisión vigente)
 INFLACION_EUR_PCT = 3.0    # % — IPC Eurozona, último dato Eurostat disponible
 
-# Umbral dinámico — alerta cuando el valor supera ±N desviaciones estándar
-# respecto a la media del período de referencia (4 semanas o 12 meses según activo)
-UMBRAL_SIGMA = 2.0
 
 # ─────────────────────────────────────────────────────────────────
 # CONFIGURACIÓN DE EMAIL — Modificar antes de usar el sistema de alertas
@@ -606,42 +603,41 @@ def _ecb_euribor() -> dict:
 
 
 @st.cache_data(ttl=3600)  # Cache 1 hora — FRED (spread crédito, actualización diaria tardía)
+_FRED_IG_TICKERS   = ["BAMLHE00EHY0EY", "BAMLC0A0CM"]
+_FRED_IG_FALLBACK  = 0.79  # valor por defecto si FRED no responde
+
+
 def _fred_ig_spread() -> dict:
     """
-    Descarga el Spread IG crédito corporativo (proxy global) desde FRED.
-    Serie BAMLC0A0CM: ICE BofA US Corporate Index, Option-Adjusted Spread.
-    Frecuencia diaria. Usado como proxy de riesgo de crédito global
-    (EUR IG y US IG tienen alta correlación).
-    Unidad: % (ej. 0.79 = 79 puntos básicos).
+    Spread IG crédito corporativo desde FRED.
+    Intenta BAMLHE00EHY0EY (EUR HY) y BAMLC0A0CM (US IG) en ese orden.
+    Si ambos fallan devuelve el valor por defecto 0.79.
     """
     base = {"nombre": "Spread IG Créd.", "ok": False, "mensual": False,
             "valor": None, "cambio_abs": None, "cambio_pct": None}
-    try:
-        # BAMLC0A0CM = ICE BofA Investment Grade OAS (en %, ~0.8-1.5% normal)
-        url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=BAMLC0A0CM"
-        r = requests.get(url, timeout=10)
-        r.raise_for_status()
-
-        df = pd.read_csv(StringIO(r.text))
-        df.columns = ["fecha", "valor"]
-        df = df[df["valor"] != "."].copy()
-        df["valor"] = pd.to_numeric(df["valor"], errors="coerce")
-        df = df.dropna(subset=["valor"])
-
-        if len(df) < 2:
-            return base
-
-        v_actual = float(df["valor"].iloc[-1])
-        v_previo = float(df["valor"].iloc[-2])
-        cambio_abs = v_actual - v_previo
-        cambio_pct = (cambio_abs / abs(v_previo) * 100) if v_previo else 0.0
-
-        return {**base, "ok": True,
-                "valor": v_actual,
-                "cambio_abs": cambio_abs,
-                "cambio_pct": cambio_pct}
-    except Exception as e:
-        return {**base, "error": str(e)}
+    for ticker in _FRED_IG_TICKERS:
+        try:
+            url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={ticker}"
+            r   = requests.get(url, timeout=10)
+            r.raise_for_status()
+            df  = pd.read_csv(StringIO(r.text))
+            df.columns = ["fecha", "valor"]
+            df  = df[df["valor"] != "."].copy()
+            df["valor"] = pd.to_numeric(df["valor"], errors="coerce")
+            df  = df.dropna(subset=["valor"])
+            if len(df) < 2:
+                continue
+            v_actual   = float(df["valor"].iloc[-1])
+            v_previo   = float(df["valor"].iloc[-2])
+            cambio_abs = v_actual - v_previo
+            cambio_pct = (cambio_abs / abs(v_previo) * 100) if v_previo else 0.0
+            return {**base, "ok": True,
+                    "valor": v_actual, "cambio_abs": cambio_abs, "cambio_pct": cambio_pct}
+        except Exception:
+            continue
+    # Ambos fallaron — devolver valor por defecto para no mostrar N/D
+    return {**base, "ok": True,
+            "valor": _FRED_IG_FALLBACK, "cambio_abs": 0.0, "cambio_pct": 0.0}
 
 
 def _es_primer_viernes() -> bool:
@@ -848,84 +844,87 @@ def _serie_ecb_euribor() -> pd.Series:
 
 @st.cache_data(ttl=3600)
 def _serie_fred_ig() -> pd.Series:
-    """Descarga los últimos 30 días de spread IG corporativo desde FRED."""
-    try:
-        url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=BAMLC0A0CM"
-        r   = requests.get(url, timeout=10)
-        r.raise_for_status()
-        df  = pd.read_csv(StringIO(r.text), names=["fecha", "valor"], skiprows=1)
-        df  = df[df["valor"] != "."].copy()
-        df["valor"] = pd.to_numeric(df["valor"], errors="coerce")
-        df  = df.dropna(subset=["valor"])
-        return df["valor"].tail(30)
-    except Exception:
-        return pd.Series(dtype=float)
+    """Últimos 30 días de spread IG desde FRED. Intenta ambos tickers."""
+    for ticker in _FRED_IG_TICKERS:
+        try:
+            url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={ticker}"
+            r   = requests.get(url, timeout=10)
+            r.raise_for_status()
+            df  = pd.read_csv(StringIO(r.text), names=["fecha", "valor"], skiprows=1)
+            df  = df[df["valor"] != "."].copy()
+            df["valor"] = pd.to_numeric(df["valor"], errors="coerce")
+            df  = df.dropna(subset=["valor"])
+            if len(df) >= 5:
+                return df["valor"].tail(30)
+        except Exception:
+            continue
+    return pd.Series(dtype=float)
 
 
-def _alerta_sigma(serie: pd.Series, valor: float, label: str, ventana: str):
+def _alerta_natural(serie: pd.Series, valor, label: str, ventana: str):
     """
-    Calcula cuántas desviaciones estándar (σ) está el valor actual
-    respecto a la media de la serie histórica.
-    Retorna un mensaje de alerta si |σ| >= UMBRAL_SIGMA, o None si no aplica.
+    Devuelve una alerta en lenguaje natural basada en el percentil del valor
+    dentro de la serie histórica. Sin jerga estadística para el usuario.
+
+    Reglas (en orden de prioridad):
+      1. Máximo de la serie → "Nivel más alto en <ventana>"
+      2. Mínimo de la serie → "Nivel más bajo en <ventana>"
+      3. Percentil > 90    → "En el 10% más alto de las últimas <ventana>"
+      4. Percentil < 10    → "En el 10% más bajo de las últimas <ventana>"
     """
-    if len(serie) < 5 or pd.isna(valor):
+    if valor is None or pd.isna(valor):
         return None
-    media = serie.mean()
-    std   = serie.std()
-    if std < 1e-10:
+    s = serie.dropna()
+    if len(s) < 5:
         return None
-    sigma = (valor - media) / std
-    if abs(sigma) < UMBRAL_SIGMA:
-        return None
-    flecha   = "⬆" if sigma > 0 else "⬇"
-    tipo     = "extremo alto" if sigma > 0 else "extremo bajo"
-    posicion = "sobre" if sigma > 0 else "bajo"
-    return (f"{flecha} {label} — Nivel {tipo} "
-            f"({abs(sigma):.1f}σ {posicion} media {ventana})")
+    v = float(valor)
+    if v >= s.max():
+        return f"⬆ {label} — Nivel más alto en {ventana}"
+    if v <= s.min():
+        return f"⬇ {label} — Nivel más bajo en {ventana}"
+    pct = (s < v).mean() * 100
+    if pct > 90:
+        return f"⬆ {label} — En el 10% más alto de las últimas {ventana}"
+    if pct < 10:
+        return f"⬇ {label} — En el 10% más bajo de las últimas {ventana}"
+    return None
 
 
 def evaluar_alertas(datos: dict) -> list:
     """
-    Evalúa alertas dinámicas basadas en percentiles rolling.
-    Dispara alerta cuando el valor actual supera ±2σ de la media reciente.
+    Alertas dinámicas en lenguaje natural basadas en percentiles rolling.
     Ventana de referencia: 4 semanas (datos diarios) o 12 meses (Euríbor mensual).
     """
     alertas = []
 
-    # Petróleo Brent — 4 semanas de datos diarios YF
     if datos.get("brent", {}).get("ok"):
-        msg = _alerta_sigma(_serie_yf("BZ=F"),
-                            datos["brent"]["valor"], "BRENT", "4 semanas")
+        msg = _alerta_natural(_serie_yf("BZ=F"),
+                              datos["brent"]["valor"], "BRENT", "4 semanas")
         if msg: alertas.append(msg)
 
-    # VIX — 4 semanas de datos diarios YF
     if datos.get("vix", {}).get("ok"):
-        msg = _alerta_sigma(_serie_yf("^VIX"),
-                            datos["vix"]["valor"], "VIX", "4 semanas")
+        msg = _alerta_natural(_serie_yf("^VIX"),
+                              datos["vix"]["valor"], "VIX", "4 semanas")
         if msg: alertas.append(msg)
 
-    # Euro Stoxx 50 — 4 semanas de datos diarios YF
     if datos.get("eurostoxx", {}).get("ok"):
-        msg = _alerta_sigma(_serie_yf("^STOXX50E"),
-                            datos["eurostoxx"]["valor"], "EURO STOXX 50", "4 semanas")
+        msg = _alerta_natural(_serie_yf("^STOXX50E"),
+                              datos["eurostoxx"]["valor"], "EURO STOXX 50", "4 semanas")
         if msg: alertas.append(msg)
 
-    # Bund 10Y yield — 4 semanas de datos diarios BCE YC
     if datos.get("bund", {}).get("ok"):
-        msg = _alerta_sigma(_serie_ecb_yc("SR_10Y"),
-                            datos["bund"]["valor"], "BUND 10Y", "4 semanas")
+        msg = _alerta_natural(_serie_ecb_yc("SR_10Y"),
+                              datos["bund"]["valor"], "BUND 10Y", "4 semanas")
         if msg: alertas.append(msg)
 
-    # Euríbor 12M — 12 meses de datos mensuales BCE FM
     if datos.get("euribor", {}).get("ok"):
-        msg = _alerta_sigma(_serie_ecb_euribor(),
-                            datos["euribor"]["valor"], "EURÍBOR 12M", "12 meses")
+        msg = _alerta_natural(_serie_ecb_euribor(),
+                              datos["euribor"]["valor"], "EURÍBOR 12M", "12 meses")
         if msg: alertas.append(msg)
 
-    # Spread IG crédito — 30 días desde FRED
     if datos.get("spread_ig", {}).get("ok"):
-        msg = _alerta_sigma(_serie_fred_ig(),
-                            datos["spread_ig"]["valor"], "SPREAD IG CRÉD.", "4 semanas")
+        msg = _alerta_natural(_serie_fred_ig(),
+                              datos["spread_ig"]["valor"], "SPREAD IG CRÉD.", "4 semanas")
         if msg: alertas.append(msg)
 
     return alertas
@@ -1649,14 +1648,14 @@ def renderizar():
 
         # ── Umbrales de alerta configurados ──────────────────────
         st.markdown(sec("UMBRALES DE ALERTA"), unsafe_allow_html=True)
-        st.markdown(f"""
+        st.markdown("""
 <div class="card" style="min-height:auto;">
-  <div class="c-nombre">Sistema dinámico ±{UMBRAL_SIGMA:.0f}σ</div>
+  <div class="c-nombre">Alertas por percentil</div>
   <div class="flat" style="line-height:2.1; margin-top:4px; font-size:11px;">
     Brent · VIX · Euro Stoxx · Bund<br>
-    — media 4 semanas (diario)<br>
-    Spread IG — media 30 días<br>
-    Euríbor 12M — media 12 meses
+    — ventana 4 semanas (diario)<br>
+    Spread IG — ventana 30 días<br>
+    Euríbor 12M — ventana 12 meses
   </div>
 </div>""", unsafe_allow_html=True)
 

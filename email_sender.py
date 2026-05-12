@@ -27,9 +27,10 @@ except ImportError:
 # CONSTANTES
 # ─────────────────────────────────────────────────────────────────
 
-TIPO_BCE_PCT      = 2.00
-INFLACION_EUR_PCT = 3.0
-UMBRAL_SIGMA      = 2.0
+TIPO_BCE_PCT       = 2.00
+INFLACION_EUR_PCT  = 3.0
+_FRED_IG_TICKERS   = ["BAMLHE00EHY0EY", "BAMLC0A0CM"]
+_FRED_IG_FALLBACK  = 0.79
 
 EMAIL_REMITENTE     = os.environ.get("EMAIL_REMITENTE", "")
 EMAIL_PASSWORD      = os.environ.get("EMAIL_PASSWORD",  "")
@@ -118,24 +119,27 @@ def _ecb_euribor() -> dict:
 def _fred_ig_spread() -> dict:
     base = {"nombre": "Spread IG Créd.", "ok": False,
             "valor": None, "cambio_abs": None, "cambio_pct": None}
-    try:
-        url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=BAMLC0A0CM"
-        r = requests.get(url, timeout=10)
-        r.raise_for_status()
-        df = pd.read_csv(StringIO(r.text), names=["fecha", "valor"], skiprows=1)
-        df = df[df["valor"] != "."].copy()
-        df["valor"] = pd.to_numeric(df["valor"], errors="coerce").dropna()
-        df = df.dropna(subset=["valor"])
-        if len(df) < 2:
-            return base
-        v_actual = float(df["valor"].iloc[-1])
-        v_previo = float(df["valor"].iloc[-2])
-        cambio_abs = v_actual - v_previo
-        cambio_pct = (cambio_abs / abs(v_previo) * 100) if v_previo else 0.0
-        return {**base, "ok": True, "valor": v_actual,
-                "cambio_abs": cambio_abs, "cambio_pct": cambio_pct}
-    except Exception:
-        return base
+    for ticker in _FRED_IG_TICKERS:
+        try:
+            url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={ticker}"
+            r   = requests.get(url, timeout=10)
+            r.raise_for_status()
+            df  = pd.read_csv(StringIO(r.text), names=["fecha", "valor"], skiprows=1)
+            df  = df[df["valor"] != "."].copy()
+            df["valor"] = pd.to_numeric(df["valor"], errors="coerce")
+            df  = df.dropna(subset=["valor"])
+            if len(df) < 2:
+                continue
+            v_actual   = float(df["valor"].iloc[-1])
+            v_previo   = float(df["valor"].iloc[-2])
+            cambio_abs = v_actual - v_previo
+            cambio_pct = (cambio_abs / abs(v_previo) * 100) if v_previo else 0.0
+            return {**base, "ok": True, "valor": v_actual,
+                    "cambio_abs": cambio_abs, "cambio_pct": cambio_pct}
+        except Exception:
+            continue
+    return {**base, "ok": True,
+            "valor": _FRED_IG_FALLBACK, "cambio_abs": 0.0, "cambio_pct": 0.0}
 
 
 def cargar_datos() -> dict:
@@ -201,79 +205,85 @@ def _serie_ecb_euribor() -> pd.Series:
 
 
 def _serie_fred_ig() -> pd.Series:
-    """Últimos 30 días de spread IG desde FRED."""
-    try:
-        url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=BAMLC0A0CM"
-        r = requests.get(url, timeout=10)
-        r.raise_for_status()
-        df = pd.read_csv(StringIO(r.text), names=["fecha", "valor"], skiprows=1)
-        df = df[df["valor"] != "."].copy()
-        df["valor"] = pd.to_numeric(df["valor"], errors="coerce")
-        df = df.dropna(subset=["valor"]).tail(30)
-        return pd.Series(df["valor"].values, dtype=float)
-    except Exception:
-        return pd.Series(dtype=float)
+    """Últimos 30 días de spread IG desde FRED. Intenta ambos tickers."""
+    for ticker in _FRED_IG_TICKERS:
+        try:
+            url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={ticker}"
+            r   = requests.get(url, timeout=10)
+            r.raise_for_status()
+            df  = pd.read_csv(StringIO(r.text), names=["fecha", "valor"], skiprows=1)
+            df  = df[df["valor"] != "."].copy()
+            df["valor"] = pd.to_numeric(df["valor"], errors="coerce")
+            df  = df.dropna(subset=["valor"])
+            if len(df) >= 5:
+                return pd.Series(df["valor"].tail(30).values, dtype=float)
+        except Exception:
+            continue
+    return pd.Series(dtype=float)
 
 # ─────────────────────────────────────────────────────────────────
 # ALERTAS DINÁMICAS ±2σ
 # ─────────────────────────────────────────────────────────────────
 
-def _alerta_sigma(serie: pd.Series, valor, label: str, ventana: str):
-    """Retorna mensaje de alerta si |σ| >= UMBRAL_SIGMA, o None."""
-    if len(serie) < 5 or valor is None or pd.isna(valor):
+def _alerta_natural(serie: pd.Series, valor, label: str, ventana: str):
+    """
+    Alerta en lenguaje natural basada en percentil.
+    1. Máximo de la serie  → "Nivel más alto en <ventana>"
+    2. Mínimo de la serie  → "Nivel más bajo en <ventana>"
+    3. Percentil > 90      → "En el 10% más alto de las últimas <ventana>"
+    4. Percentil < 10      → "En el 10% más bajo de las últimas <ventana>"
+    """
+    if valor is None or pd.isna(valor):
         return None
-    media = serie.mean()
-    std   = serie.std()
-    if std < 1e-10:
+    s = serie.dropna()
+    if len(s) < 5:
         return None
-    sigma = (valor - media) / std
-    if abs(sigma) < UMBRAL_SIGMA:
-        return None
-    flecha  = "⬆" if sigma > 0 else "⬇"
-    tipo    = "extremo alto" if sigma > 0 else "extremo bajo"
-    posicion = "sobre" if sigma > 0 else "bajo"
-    return f"{flecha} {label} — Nivel {tipo} ({abs(sigma):.1f}σ {posicion} media {ventana})"
+    v = float(valor)
+    if v >= s.max():
+        return f"⬆ {label} — Nivel más alto en {ventana}"
+    if v <= s.min():
+        return f"⬇ {label} — Nivel más bajo en {ventana}"
+    pct = (s < v).mean() * 100
+    if pct > 90:
+        return f"⬆ {label} — En el 10% más alto de las últimas {ventana}"
+    if pct < 10:
+        return f"⬇ {label} — En el 10% más bajo de las últimas {ventana}"
+    return None
 
 
 def evaluar_alertas(datos: dict) -> list:
-    """Alertas dinámicas ±2σ para Brent, VIX, Euro Stoxx, Bund, Euríbor, Spread IG."""
+    """Alertas en lenguaje natural por percentil para Brent, VIX, Euro Stoxx, Bund, Euríbor, Spread IG."""
     alertas = []
 
     if datos.get("brent", {}).get("ok"):
-        msg = _alerta_sigma(_serie_yf("BZ=F"), datos["brent"]["valor"],
-                            "BRENT", "4 semanas")
-        if msg:
-            alertas.append(msg)
+        msg = _alerta_natural(_serie_yf("BZ=F"), datos["brent"]["valor"],
+                              "BRENT", "4 semanas")
+        if msg: alertas.append(msg)
 
     if datos.get("vix", {}).get("ok"):
-        msg = _alerta_sigma(_serie_yf("^VIX"), datos["vix"]["valor"],
-                            "VIX", "4 semanas")
-        if msg:
-            alertas.append(msg)
+        msg = _alerta_natural(_serie_yf("^VIX"), datos["vix"]["valor"],
+                              "VIX", "4 semanas")
+        if msg: alertas.append(msg)
 
     if datos.get("eurostoxx", {}).get("ok"):
-        msg = _alerta_sigma(_serie_yf("^STOXX50E"), datos["eurostoxx"]["valor"],
-                            "EURO STOXX 50", "4 semanas")
-        if msg:
-            alertas.append(msg)
+        msg = _alerta_natural(_serie_yf("^STOXX50E"), datos["eurostoxx"]["valor"],
+                              "EURO STOXX 50", "4 semanas")
+        if msg: alertas.append(msg)
 
     if datos.get("bund", {}).get("ok"):
-        msg = _alerta_sigma(_serie_ecb_yc("SR_10Y"), datos["bund"]["valor"],
-                            "BUND 10Y", "4 semanas")
-        if msg:
-            alertas.append(msg)
+        msg = _alerta_natural(_serie_ecb_yc("SR_10Y"), datos["bund"]["valor"],
+                              "BUND 10Y", "4 semanas")
+        if msg: alertas.append(msg)
 
     if datos.get("euribor", {}).get("ok"):
-        msg = _alerta_sigma(_serie_ecb_euribor(), datos["euribor"]["valor"],
-                            "EURÍBOR 12M", "12 meses")
-        if msg:
-            alertas.append(msg)
+        msg = _alerta_natural(_serie_ecb_euribor(), datos["euribor"]["valor"],
+                              "EURÍBOR 12M", "12 meses")
+        if msg: alertas.append(msg)
 
     if datos.get("spread_ig", {}).get("ok"):
-        msg = _alerta_sigma(_serie_fred_ig(), datos["spread_ig"]["valor"],
-                            "SPREAD IG", "30 días")
-        if msg:
-            alertas.append(msg)
+        msg = _alerta_natural(_serie_fred_ig(), datos["spread_ig"]["valor"],
+                              "SPREAD IG CRÉD.", "4 semanas")
+        if msg: alertas.append(msg)
 
     return alertas
 
@@ -347,7 +357,7 @@ def construir_cuerpo(alertas: list, datos: dict) -> str:
 
     lineas += [
         "",
-        f"  Alertas dinámicas: ±{UMBRAL_SIGMA:.0f}σ sobre media histórica rolling.",
+        "  Alertas dinámicas por percentil (máx/mín o top/bottom 10%) sobre ventana rolling.",
         sep_doble,
         "  Email generado automáticamente — Olea Gestión Dashboard.",
         "  Solo para uso interno. Datos con posible retraso de 15-20 min.",
