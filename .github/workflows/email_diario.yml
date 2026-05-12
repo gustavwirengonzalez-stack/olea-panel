@@ -1,27 +1,21 @@
 name: Email Diario de Mercados
-
 on:
   schedule:
-    - cron: '0 7 * * 1-5'  # 9AM Madrid hora de verano (CEST, UTC+2)
-    - cron: '0 8 * * 1-5'  # 9AM Madrid hora de invierno (CET, UTC+1)
-  workflow_dispatch:        # permite lanzarlo manualmente desde GitHub
-
+    - cron: '0 7 * * 1-5'
+    - cron: '0 8 * * 1-5'
+  workflow_dispatch:
 jobs:
   enviar-email:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout código
+      - name: Checkout codigo
         uses: actions/checkout@v4
-
       - name: Configurar Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
       - name: Instalar dependencias
         run: pip install yfinance pandas requests feedparser
-
       - name: Enviar email diario
         env:
           EMAIL_REMITENTE: ${{ secrets.EMAIL_REMITENTE }}
