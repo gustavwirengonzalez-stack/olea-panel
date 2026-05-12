@@ -15,9 +15,9 @@ jobs:
         with:
           python-version: '3.11'
       - name: Instalar dependencias
-        run: pip install yfinance pandas requests feedparser
+        run: pip install yfinance pandas requests
       - name: Enviar email diario
         env:
           EMAIL_REMITENTE: ${{ secrets.EMAIL_REMITENTE }}
           EMAIL_PASSWORD:  ${{ secrets.EMAIL_PASSWORD }}
-        run: python dashboard.py --daily
+        run: python email_sender.py
