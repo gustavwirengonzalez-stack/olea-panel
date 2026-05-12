@@ -602,7 +602,6 @@ def _ecb_euribor() -> dict:
         return {**base, "error": str(e)}
 
 
-@st.cache_data(ttl=3600)  # Cache 1 hora — FRED (spread crédito, actualización diaria tardía)
 _FRED_IG_TICKERS   = ["BAMLHE00EHY0EY", "BAMLC0A0CM"]
 _FRED_IG_FALLBACK  = 0.79  # valor por defecto si FRED no responde
 
