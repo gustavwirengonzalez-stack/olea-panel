@@ -89,11 +89,9 @@ if not _CLI_MODE and not _WEEKLY_MODE and not _DAILY_MODE:
 TIPO_BCE_PCT      = 2.00   # % — Tipo de depósito BCE (decisión vigente)
 INFLACION_EUR_PCT = 3.0    # % — IPC Eurozona, último dato Eurostat disponible
 
-# Umbrales de alerta — modificar según criterio de la gestora
-UMBRAL_BRENT_USD       = 120.0   # USD   — Alerta si Brent supera este precio
-UMBRAL_VIX             = 25.0    # pts   — Alerta si VIX supera este nivel
-UMBRAL_EURIBOR_CAMBIO  = 0.05    # %     — Alerta si Euríbor sube más en un mes
-UMBRAL_EUROSTOXX_CAIDA = -1.5    # %     — Alerta si Euro Stoxx cae más en el día
+# Umbral dinámico — alerta cuando el valor supera ±N desviaciones estándar
+# respecto a la media del período de referencia (4 semanas o 12 meses según activo)
+UMBRAL_SIGMA = 2.0
 
 # ─────────────────────────────────────────────────────────────────
 # CONFIGURACIÓN DE EMAIL — Modificar antes de usar el sistema de alertas
@@ -801,48 +799,134 @@ def _construir_fallback(ahora: datetime) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────
-# LÓGICA DE ALERTAS
+# ALERTAS DINÁMICAS — percentiles rolling ±2σ
 # ─────────────────────────────────────────────────────────────────
 
-def evaluar_alertas(d: dict) -> list[str]:
+@st.cache_data(ttl=300)
+def _serie_yf(ticker: str) -> pd.Series:
+    """Descarga 4 semanas de precios diarios de cierre desde Yahoo Finance."""
+    try:
+        hist = yf.Ticker(ticker).history(period="1mo", interval="1d")
+        return hist["Close"].dropna()
+    except Exception:
+        return pd.Series(dtype=float)
+
+
+@st.cache_data(ttl=300)
+def _serie_ecb_yc(plazo: str) -> pd.Series:
+    """Descarga ~30 observaciones diarias de la curva BCE (bonos AAA zona euro)."""
+    try:
+        key = f"B.U2.EUR.4F.G_N_A.SV_C_YM.{plazo}"
+        url = (f"https://data-api.ecb.europa.eu/service/data/YC/{key}"
+               f"?lastNObservations=30")
+        r = requests.get(url, timeout=12,
+                         headers={"Accept": "application/vnd.sdmx.data+json;version=1.0.0-wd"})
+        r.raise_for_status()
+        obs  = list(r.json()["dataSets"][0]["series"].values())[0]["observations"]
+        vals = [float(obs[k][0]) for k in sorted(obs.keys(), key=int)]
+        return pd.Series(vals, dtype=float)
+    except Exception:
+        return pd.Series(dtype=float)
+
+
+@st.cache_data(ttl=600)
+def _serie_ecb_euribor() -> pd.Series:
+    """Descarga 12 meses de Euríbor 12M mensual desde el BCE (dataset FM).
+    Se usa una ventana de 12 meses porque la frecuencia del dato es mensual."""
+    try:
+        url = ("https://data-api.ecb.europa.eu/service/data/FM/"
+               "M.U2.EUR.RT.MM.EURIBOR1YD_.HSTA?lastNObservations=12")
+        r = requests.get(url, timeout=12,
+                         headers={"Accept": "application/vnd.sdmx.data+json;version=1.0.0-wd"})
+        r.raise_for_status()
+        obs  = list(r.json()["dataSets"][0]["series"].values())[0]["observations"]
+        vals = [float(obs[k][0]) for k in sorted(obs.keys(), key=int)]
+        return pd.Series(vals, dtype=float)
+    except Exception:
+        return pd.Series(dtype=float)
+
+
+@st.cache_data(ttl=3600)
+def _serie_fred_ig() -> pd.Series:
+    """Descarga los últimos 30 días de spread IG corporativo desde FRED."""
+    try:
+        url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=BAMLC0A0CM"
+        r   = requests.get(url, timeout=10)
+        r.raise_for_status()
+        df  = pd.read_csv(StringIO(r.text), names=["fecha", "valor"], skiprows=1)
+        df  = df[df["valor"] != "."].copy()
+        df["valor"] = pd.to_numeric(df["valor"], errors="coerce")
+        df  = df.dropna(subset=["valor"])
+        return df["valor"].tail(30)
+    except Exception:
+        return pd.Series(dtype=float)
+
+
+def _alerta_sigma(serie: pd.Series, valor: float, label: str, ventana: str):
     """
-    Comprueba los umbrales definidos en CONSTANTES al inicio del archivo.
-    Retorna una lista de strings con los mensajes de alerta activos.
-    Una lista vacía significa que todo está dentro de los rangos normales.
+    Calcula cuántas desviaciones estándar (σ) está el valor actual
+    respecto a la media de la serie histórica.
+    Retorna un mensaje de alerta si |σ| >= UMBRAL_SIGMA, o None si no aplica.
+    """
+    if len(serie) < 5 or pd.isna(valor):
+        return None
+    media = serie.mean()
+    std   = serie.std()
+    if std < 1e-10:
+        return None
+    sigma = (valor - media) / std
+    if abs(sigma) < UMBRAL_SIGMA:
+        return None
+    flecha   = "⬆" if sigma > 0 else "⬇"
+    tipo     = "extremo alto" if sigma > 0 else "extremo bajo"
+    posicion = "sobre" if sigma > 0 else "bajo"
+    return (f"{flecha} {label} — Nivel {tipo} "
+            f"({abs(sigma):.1f}σ {posicion} media {ventana})")
+
+
+def evaluar_alertas(datos: dict) -> list:
+    """
+    Evalúa alertas dinámicas basadas en percentiles rolling.
+    Dispara alerta cuando el valor actual supera ±2σ de la media reciente.
+    Ventana de referencia: 4 semanas (datos diarios) o 12 meses (Euríbor mensual).
     """
     alertas = []
 
-    # Alerta 1: Petróleo Brent > umbral
-    b = d.get("brent", {})
-    if b.get("ok") and b.get("valor") is not None and b["valor"] > UMBRAL_BRENT_USD:
-        alertas.append(
-            f"BRENT  {b['valor']:.2f} USD — Supera umbral de {UMBRAL_BRENT_USD:.0f} USD "
-            f"(presión inflacionaria en costes energéticos)"
-        )
+    # Petróleo Brent — 4 semanas de datos diarios YF
+    if datos.get("brent", {}).get("ok"):
+        msg = _alerta_sigma(_serie_yf("BZ=F"),
+                            datos["brent"]["valor"], "BRENT", "4 semanas")
+        if msg: alertas.append(msg)
 
-    # Alerta 2: VIX > umbral (estrés sistémico)
-    v = d.get("vix", {})
-    if v.get("ok") and v.get("valor") is not None and v["valor"] > UMBRAL_VIX:
-        alertas.append(
-            f"VIX  {v['valor']:.2f} pts — Volatilidad elevada, umbral {UMBRAL_VIX:.0f} "
-            f"(posible episodio de risk-off)"
-        )
+    # VIX — 4 semanas de datos diarios YF
+    if datos.get("vix", {}).get("ok"):
+        msg = _alerta_sigma(_serie_yf("^VIX"),
+                            datos["vix"]["valor"], "VIX", "4 semanas")
+        if msg: alertas.append(msg)
 
-    # Alerta 3: Euríbor sube más de X% en el mes (dato mensual)
-    e = d.get("euribor", {})
-    if e.get("ok") and e.get("cambio_abs") is not None and e["cambio_abs"] > UMBRAL_EURIBOR_CAMBIO:
-        alertas.append(
-            f"EURÍBOR 12M  +{e['cambio_abs']:.4f}% MoM — "
-            f"Subida superior a {UMBRAL_EURIBOR_CAMBIO}% (impacto en cartera RF)"
-        )
+    # Euro Stoxx 50 — 4 semanas de datos diarios YF
+    if datos.get("eurostoxx", {}).get("ok"):
+        msg = _alerta_sigma(_serie_yf("^STOXX50E"),
+                            datos["eurostoxx"]["valor"], "EURO STOXX 50", "4 semanas")
+        if msg: alertas.append(msg)
 
-    # Alerta 4: Euro Stoxx 50 cae más de X% en el día
-    es = d.get("eurostoxx", {})
-    if es.get("ok") and es.get("cambio_pct") is not None and es["cambio_pct"] < UMBRAL_EUROSTOXX_CAIDA:
-        alertas.append(
-            f"EURO STOXX 50  {es['cambio_pct']:.2f}% en el día — "
-            f"Caída superior al {abs(UMBRAL_EUROSTOXX_CAIDA):.1f}% (revisar coberturas)"
-        )
+    # Bund 10Y yield — 4 semanas de datos diarios BCE YC
+    if datos.get("bund", {}).get("ok"):
+        msg = _alerta_sigma(_serie_ecb_yc("SR_10Y"),
+                            datos["bund"]["valor"], "BUND 10Y", "4 semanas")
+        if msg: alertas.append(msg)
+
+    # Euríbor 12M — 12 meses de datos mensuales BCE FM
+    if datos.get("euribor", {}).get("ok"):
+        msg = _alerta_sigma(_serie_ecb_euribor(),
+                            datos["euribor"]["valor"], "EURÍBOR 12M", "12 meses")
+        if msg: alertas.append(msg)
+
+    # Spread IG crédito — 30 días desde FRED
+    if datos.get("spread_ig", {}).get("ok"):
+        msg = _alerta_sigma(_serie_fred_ig(),
+                            datos["spread_ig"]["valor"], "SPREAD IG CRÉD.", "4 semanas")
+        if msg: alertas.append(msg)
 
     return alertas
 
@@ -1567,12 +1651,12 @@ def renderizar():
         st.markdown(sec("UMBRALES DE ALERTA"), unsafe_allow_html=True)
         st.markdown(f"""
 <div class="card" style="min-height:auto;">
-  <div class="c-nombre">Parámetros configurados</div>
+  <div class="c-nombre">Sistema dinámico ±{UMBRAL_SIGMA:.0f}σ</div>
   <div class="flat" style="line-height:2.1; margin-top:4px; font-size:11px;">
-    Brent &gt; {UMBRAL_BRENT_USD:.0f} USD<br>
-    VIX &gt; {UMBRAL_VIX:.0f} pts<br>
-    Euríbor MoM &gt; +{UMBRAL_EURIBOR_CAMBIO}%<br>
-    EuroStoxx &lt; {UMBRAL_EUROSTOXX_CAIDA:.1f}% / día
+    Brent · VIX · Euro Stoxx · Bund<br>
+    — media 4 semanas (diario)<br>
+    Spread IG — media 30 días<br>
+    Euríbor 12M — media 12 meses
   </div>
 </div>""", unsafe_allow_html=True)
 

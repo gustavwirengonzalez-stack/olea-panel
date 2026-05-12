@@ -29,11 +29,7 @@ except ImportError:
 
 TIPO_BCE_PCT      = 2.00
 INFLACION_EUR_PCT = 3.0
-
-UMBRAL_BRENT_USD       = 120.0
-UMBRAL_VIX             = 25.0
-UMBRAL_EURIBOR_CAMBIO  = 0.05
-UMBRAL_EUROSTOXX_CAIDA = -1.5
+UMBRAL_SIGMA      = 2.0
 
 EMAIL_REMITENTE     = os.environ.get("EMAIL_REMITENTE", "")
 EMAIL_PASSWORD      = os.environ.get("EMAIL_PASSWORD",  "")
@@ -43,7 +39,7 @@ EMAIL_DESTINATARIOS = [
 ]
 
 # ─────────────────────────────────────────────────────────────────
-# OBTENCIÓN DE DATOS
+# OBTENCIÓN DE DATOS (valor actual)
 # ─────────────────────────────────────────────────────────────────
 
 def _yf(ticker: str, nombre: str) -> dict:
@@ -155,26 +151,130 @@ def cargar_datos() -> dict:
         "oro":      _yf("GC=F",      "Oro"),
         "vix":      _yf("^VIX",      "VIX"),
         "eurusd":   _yf("EURUSD=X",  "EUR / USD"),
+        "spread_ig":_fred_ig_spread(),
     }
 
 # ─────────────────────────────────────────────────────────────────
-# ALERTAS
+# SERIES HISTÓRICAS (para cálculo de σ dinámico)
 # ─────────────────────────────────────────────────────────────────
 
-def evaluar_alertas(d: dict) -> list:
+def _serie_yf(ticker: str) -> pd.Series:
+    """4 semanas de precios diarios de cierre desde Yahoo Finance."""
+    if not _YF_OK:
+        return pd.Series(dtype=float)
+    try:
+        hist = yf.Ticker(ticker).history(period="1mo", interval="1d")
+        return hist["Close"].dropna()
+    except Exception:
+        return pd.Series(dtype=float)
+
+
+def _serie_ecb_yc(plazo: str) -> pd.Series:
+    """~30 observaciones diarias de la curva BCE."""
+    try:
+        key = f"B.U2.EUR.4F.G_N_A.SV_C_YM.{plazo}"
+        url = (f"https://data-api.ecb.europa.eu/service/data/YC/{key}"
+               f"?lastNObservations=30")
+        r = requests.get(url, timeout=12,
+                         headers={"Accept": "application/vnd.sdmx.data+json;version=1.0.0-wd"})
+        r.raise_for_status()
+        obs = list(r.json()["dataSets"][0]["series"].values())[0]["observations"]
+        valores = [float(obs[k][0]) for k in sorted(obs.keys(), key=lambda x: int(x))]
+        return pd.Series(valores, dtype=float)
+    except Exception:
+        return pd.Series(dtype=float)
+
+
+def _serie_ecb_euribor() -> pd.Series:
+    """12 meses de Euríbor 12M mensual desde BCE FM."""
+    try:
+        url = ("https://data-api.ecb.europa.eu/service/data/FM/"
+               "M.U2.EUR.RT.MM.EURIBOR1YD_.HSTA?lastNObservations=12")
+        r = requests.get(url, timeout=12,
+                         headers={"Accept": "application/vnd.sdmx.data+json;version=1.0.0-wd"})
+        r.raise_for_status()
+        obs = list(r.json()["dataSets"][0]["series"].values())[0]["observations"]
+        valores = [float(obs[k][0]) for k in sorted(obs.keys(), key=lambda x: int(x))]
+        return pd.Series(valores, dtype=float)
+    except Exception:
+        return pd.Series(dtype=float)
+
+
+def _serie_fred_ig() -> pd.Series:
+    """Últimos 30 días de spread IG desde FRED."""
+    try:
+        url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=BAMLC0A0CM"
+        r = requests.get(url, timeout=10)
+        r.raise_for_status()
+        df = pd.read_csv(StringIO(r.text), names=["fecha", "valor"], skiprows=1)
+        df = df[df["valor"] != "."].copy()
+        df["valor"] = pd.to_numeric(df["valor"], errors="coerce")
+        df = df.dropna(subset=["valor"]).tail(30)
+        return pd.Series(df["valor"].values, dtype=float)
+    except Exception:
+        return pd.Series(dtype=float)
+
+# ─────────────────────────────────────────────────────────────────
+# ALERTAS DINÁMICAS ±2σ
+# ─────────────────────────────────────────────────────────────────
+
+def _alerta_sigma(serie: pd.Series, valor, label: str, ventana: str):
+    """Retorna mensaje de alerta si |σ| >= UMBRAL_SIGMA, o None."""
+    if len(serie) < 5 or valor is None or pd.isna(valor):
+        return None
+    media = serie.mean()
+    std   = serie.std()
+    if std < 1e-10:
+        return None
+    sigma = (valor - media) / std
+    if abs(sigma) < UMBRAL_SIGMA:
+        return None
+    flecha  = "⬆" if sigma > 0 else "⬇"
+    tipo    = "extremo alto" if sigma > 0 else "extremo bajo"
+    posicion = "sobre" if sigma > 0 else "bajo"
+    return f"{flecha} {label} — Nivel {tipo} ({abs(sigma):.1f}σ {posicion} media {ventana})"
+
+
+def evaluar_alertas(datos: dict) -> list:
+    """Alertas dinámicas ±2σ para Brent, VIX, Euro Stoxx, Bund, Euríbor, Spread IG."""
     alertas = []
-    b = d.get("brent", {})
-    if b.get("ok") and b.get("valor") and b["valor"] > UMBRAL_BRENT_USD:
-        alertas.append(f"BRENT  {b['valor']:.2f} USD — Supera umbral de {UMBRAL_BRENT_USD:.0f} USD")
-    v = d.get("vix", {})
-    if v.get("ok") and v.get("valor") and v["valor"] > UMBRAL_VIX:
-        alertas.append(f"VIX  {v['valor']:.2f} pts — Volatilidad elevada, umbral {UMBRAL_VIX:.0f}")
-    e = d.get("euribor", {})
-    if e.get("ok") and e.get("cambio_abs") and e["cambio_abs"] > UMBRAL_EURIBOR_CAMBIO:
-        alertas.append(f"EURÍBOR 12M  +{e['cambio_abs']:.4f}% MoM — Subida superior a {UMBRAL_EURIBOR_CAMBIO}%")
-    es = d.get("eurostoxx", {})
-    if es.get("ok") and es.get("cambio_pct") and es["cambio_pct"] < UMBRAL_EUROSTOXX_CAIDA:
-        alertas.append(f"EURO STOXX 50  {es['cambio_pct']:.2f}% en el día — Caída superior al {abs(UMBRAL_EUROSTOXX_CAIDA):.1f}%")
+
+    if datos.get("brent", {}).get("ok"):
+        msg = _alerta_sigma(_serie_yf("BZ=F"), datos["brent"]["valor"],
+                            "BRENT", "4 semanas")
+        if msg:
+            alertas.append(msg)
+
+    if datos.get("vix", {}).get("ok"):
+        msg = _alerta_sigma(_serie_yf("^VIX"), datos["vix"]["valor"],
+                            "VIX", "4 semanas")
+        if msg:
+            alertas.append(msg)
+
+    if datos.get("eurostoxx", {}).get("ok"):
+        msg = _alerta_sigma(_serie_yf("^STOXX50E"), datos["eurostoxx"]["valor"],
+                            "EURO STOXX 50", "4 semanas")
+        if msg:
+            alertas.append(msg)
+
+    if datos.get("bund", {}).get("ok"):
+        msg = _alerta_sigma(_serie_ecb_yc("SR_10Y"), datos["bund"]["valor"],
+                            "BUND 10Y", "4 semanas")
+        if msg:
+            alertas.append(msg)
+
+    if datos.get("euribor", {}).get("ok"):
+        msg = _alerta_sigma(_serie_ecb_euribor(), datos["euribor"]["valor"],
+                            "EURÍBOR 12M", "12 meses")
+        if msg:
+            alertas.append(msg)
+
+    if datos.get("spread_ig", {}).get("ok"):
+        msg = _alerta_sigma(_serie_fred_ig(), datos["spread_ig"]["valor"],
+                            "SPREAD IG", "30 días")
+        if msg:
+            alertas.append(msg)
+
     return alertas
 
 
@@ -243,9 +343,11 @@ def construir_cuerpo(alertas: list, datos: dict) -> str:
     lineas.append(_fila("Bund 10Y",        datos.get("bund",     {}), dec=3, suf="%"))
     lineas.append(_fila("Treasury 10Y",    datos.get("treasury", {}), dec=3, suf="%"))
     lineas.append(_fila("Euríbor 12M",     datos.get("euribor",  {}), dec=3, suf="%"))
+    lineas.append(_fila("Spread IG",       datos.get("spread_ig",{}), dec=2, suf=" pb"))
 
     lineas += [
         "",
+        f"  Alertas dinámicas: ±{UMBRAL_SIGMA:.0f}σ sobre media histórica rolling.",
         sep_doble,
         "  Email generado automáticamente — Olea Gestión Dashboard.",
         "  Solo para uso interno. Datos con posible retraso de 15-20 min.",
